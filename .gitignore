@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.env
+videos/full/
+videos/clips/
+logs/
+ffmpeg 7.1.1/

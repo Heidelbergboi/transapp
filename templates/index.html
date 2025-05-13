@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="sq">
+<head>
+  <meta charset="utf-8">
+  <title>TransApp – Dritare.net</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  >
+  <style>
+    body { background: #f8f9fa; }
+    .brand { color: #c41e3a; font-weight: bold; }
+  </style>
+</head>
+<body class="py-5">
+  <div class="container">
+    <h1 class="brand mb-4">TransApp</h1>
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% if messages %}
+        {% for cat, msg in messages %}
+          <div class="alert alert-{{ cat }} alert-dismissible">
+            {{ msg }}
+            <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+          </div>
+        {% endfor %}
+      {% endif %}
+    {% endwith %}
+
+    <form method="POST" enctype="multipart/form-data" class="card p-4 shadow-sm">
+      <div class="mb-3">
+        <label class="form-label">YouTube link (opsional)</label>
+        <input type="url" name="youtubelink" class="form-control"
+               placeholder="https://youtu.be/..." >
+      </div>
+      <div class="text-center my-2"><strong>— ose —</strong></div>
+      <div class="mb-3">
+        <label class="form-label">Ngarko MP4</label>
+        <input type="file" name="videofile" accept=".mp4" class="form-control">
+      </div>
+      <div class="mb-3">
+        <label class="form-label">Numri i pjesëve</label>
+        <input type="number" name="parts" min="2" value="5"
+               class="form-control">
+      </div>
+      <button type="submit" class="btn btn-danger w-100">Proces-o</button>
+    </form>
+  </div>
+  <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>

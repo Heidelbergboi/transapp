@@ -1,0 +1,56 @@
+<!DOCTYPE html>
+<html lang="sq">
+<head>
+  <meta charset="utf-8">
+  <title>Gati! – TransApp</title>
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link
+    href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css"
+    rel="stylesheet"
+  >
+  <style>
+    body { background: #fff; }
+    .brand { color: #c41e3a; font-weight: bold; }
+    .clip-card { transition: transform .1s; }
+    .clip-card:hover { transform: scale(1.02); }
+  </style>
+</head>
+<body class="py-5">
+  <div class="container">
+    <h1 class="brand mb-4">🎉 Gati! Klipet Tuaja</h1>
+    {% if not clips %}
+      <div class="alert alert-warning">Asnjë titull nuk u gjet.</div>
+    {% else %}
+      <div class="row g-4">
+        {% for c in clips %}
+        <div class="col-md-6">
+          <div class="card clip-card shadow-sm">
+            <video
+              class="card-img-top"
+              controls
+              src="{{ url_for('serve_clip', filename=c.file) }}"
+            ></video>
+            <div class="card-body">
+              <h5 class="card-title">{{ c.title }}</h5>
+              <a
+                href="{{ url_for('serve_clip', filename=c.file) }}"
+                download="{{ c.title }}.mp4"
+                class="btn btn-danger"
+              >
+                Shkarko
+              </a>
+            </div>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+
+    <div class="mt-4 text-center">
+      <a href="{{ url_for('index') }}" class="btn btn-outline-secondary">
+        ← Kthehu në Fillim
+      </a>
+    </div>
+  </div>
+</body>
+</html>
