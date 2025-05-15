@@ -3,21 +3,15 @@
 title_clips.py
 ──────────────
 Iterate over each .mp4 in videos/clips, be sure audio exists (add silence
-if needed), send to GPT-4o mini Transcribe, ask GPT-3.5 for a short Albanian
-title, save results to logs/clip_titles_<timestamp>.csv.
+if needed), send to GPT-4o mini Transcribe, ask GPT-3.5 for a short Albanian title,
+save results to logs/clip_titles_<timestamp>.csv.
 """
 
 from __future__ import annotations
-import csv
-import os
-import subprocess
-import tempfile
-import sys
-import datetime
+import csv, os, subprocess, tempfile, sys, datetime
 from pathlib import Path
 
-import dotenv
-import openai
+import dotenv, openai
 from tqdm import tqdm
 
 # ── console (ASCII fallback) ────────────────────────────────────────────
@@ -27,28 +21,28 @@ try:
 except Exception:
     ARROW, WARN = "->", "WARNING"
 
-# ── paths & env ─────────────────────────────────────────────────────────
-BASE    = Path(__file__).resolve().parent
-CLIPS   = BASE / "videos" / "clips"
-LOG_DIR = BASE / "logs"
-CLIPS.mkdir(parents=True, exist_ok=True)
-LOG_DIR.mkdir(parents=True, exist_ok=True)
+# ── paths ----------------------------------------------------------------
+BASE      = Path(__file__).resolve().parent
+CLIPS     = BASE / "videos" / "clips"
+LOG_DIR   = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
 
+# load environment variables from .env
 dotenv.load_dotenv(BASE / ".env", override=True)
 
-# ── ffmpeg / ffprobe ────────────────────────────────────────────────────
-FFMPEG = os.getenv("FFMPEG_BINARY", "ffmpeg")
+# ffmpeg / ffprobe binaries
+FFMPEG  = os.getenv("FFMPEG_BINARY", "ffmpeg")
 def ffprobe_bin() -> str:
     p = Path(FFMPEG)
     probe = p.with_name("ffprobe.exe" if p.suffix.lower()==".exe" else "ffprobe")
     return str(probe) if probe.exists() else "ffprobe"
 FFPROBE = ffprobe_bin()
 
-# ── OpenAI setup ────────────────────────────────────────────────────────
+# OpenAI API key
 openai.api_key = os.getenv("OPENAI_API_KEY", "")
 if not openai.api_key:
     sys.exit(f"{WARN}: OPENAI_API_KEY not set in environment")
 
+# system prompt for title generation
 SYSTEM_MSG = (
     "Je një asistent që sugjeron tituj shumë të shkurtër (2–7 fjalë), "
     "në shqip, sensacionalë por korrektë, bazuar në transkriptin e klipit."
@@ -60,7 +54,7 @@ def albanian_title(text: str) -> str:
         "(2–7 fjalë), pa thonjëza.\n\n" + text
     )
     r = openai.chat.completions.create(
-        model="gpt-3.5-turbo",
+        model="gpt-4",
         temperature=0.6,
         messages=[
             {"role": "system", "content": SYSTEM_MSG},
@@ -69,7 +63,7 @@ def albanian_title(text: str) -> str:
     )
     return r.choices[0].message.content.strip()
 
-# ── audio helpers ───────────────────────────────────────────────────────
+# ── audio helpers --------------------------------------------------------
 def has_audio(path: Path) -> bool:
     cmd = [
         FFPROBE, "-v", "error", "-select_streams", "a",
@@ -103,11 +97,12 @@ def extract_ogg(mp4: Path) -> Path:
     subprocess.check_call(cmd)
     return tmp
 
-# ── processing ─────────────────────────────────────────────────────────
+# ── processing -----------------------------------------------------------
 def process_clip(mp4: Path) -> tuple[str, str] | None:
     try:
         ogg = extract_ogg(mp4)
         with ogg.open("rb") as fh:
+            # use GPT-4o mini Transcribe for speech-to-text
             txt = openai.audio.transcriptions.create(
                 model="gpt-4o-mini-transcribe",
                 file=fh,
@@ -121,14 +116,14 @@ def process_clip(mp4: Path) -> tuple[str, str] | None:
         return None
     finally:
         try:
-            ogg.unlink(missing_ok=True)
+            ogg.unlink(missing_ok=True)  # remove temp file
         except Exception:
             pass
 
 def main() -> None:
     clips = sorted(CLIPS.glob("*.mp4"))
     if not clips:
-        print(f"{WARN}: No clips found in {CLIPS!r}")
+        print("No clips found in", CLIPS)
         return
 
     rows: list[tuple[str, str]] = []
