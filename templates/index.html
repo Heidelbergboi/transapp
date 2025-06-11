@@ -1,62 +1,59 @@
-<!DOCTYPE html>
-<html lang="sq">
-<head>
-  <meta charset="utf-8">
-  <title>TransApp – Dritare.tv</title>
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
-  <style>body{background:#f8f9fa}.brand{color:#c41e3a;font-weight:700}</style>
-</head>
-<body class="py-5">
-<div class="container">
-  <h1 class="brand mb-4">TransApp</h1>
-
-  <div class="card p-4 shadow-sm">
-    <div class="mb-3">
-      <input type="file" id="file" accept="video/mp4" class="form-control">
-    </div>
-    <div class="mb-3">
-      <label class="form-label">Numri i pjesëve</label>
-      <input type="number" id="parts" class="form-control" min="2" value="5">
-    </div>
-    <button class="btn btn-danger w-100" onclick="upload()">Starto</button>
-  </div>
-
-  <pre id="log" class="mt-4"></pre>
-</div>
-
 <script>
-async function upload(){
-  const f=document.getElementById('file').files[0];
-  if(!f){alert("Zgjidhni një MP4");return;}
-  const logEl=x=>document.getElementById('log').textContent+=x+"\n";
+async function upload () {
+  const file   = document.getElementById('file').files[0];
+  const parts  = document.getElementById('parts').value || 5;
+  const log    = t => (document.getElementById('log').textContent += t + '\n');
 
-  /* 1. presign */
-  logEl("Marr URL-në e ngarkimit…");
-  const sign=await fetch("/sign",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({filename:f.name})
-  }).then(r=>r.json());
+  if (!file) { alert('Zgjidhni një MP4'); return; }
 
-  /* 2. POST direkt në S3 */
-  const fd=new FormData();
-  Object.entries(sign.fields).forEach(([k,v])=>fd.append(k,v));
-  fd.append("Content-Type","video/mp4");
-  fd.append("file",f);
-  logEl("Ngarkim direkt në S3…");
-  await fetch(sign.url,{method:"POST",body:fd});
-  logEl("✅ Upload përfundoi");
+  /* 1) presign ---------------------------------------------------- */
+  log('🚦 /sign …');
+  const sign = await fetch('/sign', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ filename: file.name })
+      }).then(r => r.json());
 
-  /* 3. nis job-in */
-  const start=await fetch("/start-job",{method:"POST",
-      headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({s3_key:sign.s3_key,parts:document.getElementById('parts').value})
-  }).then(r=>r.json());
+  /* 2) direct POST to S3 (with progress) -------------------------- */
+  const fd = new FormData();
+  Object.entries(sign.fields).forEach(([k, v]) => fd.append(k, v));
+  fd.append('file', file);                         // MUST be last
 
-  /* 4. ridrejtohu te stream-i */
-  window.location=start.stream;
+  log(`⬆️  Uploading ${prettyBytes(file.size)} to S3…`);
+  await new Promise((resolve, reject) => {
+    const xhr = new XMLHttpRequest();
+    xhr.open('POST', sign.url, true);
+
+    xhr.upload.onprogress = ev => {
+      if (!ev.lengthComputable) return;
+      const pct = (ev.loaded / ev.total * 100).toFixed(1);
+      log(`   … ${pct}% (${prettyBytes(ev.loaded)} / ${prettyBytes(ev.total)})`);
+    };
+
+    xhr.onload  = () => xhr.status === 204 ? resolve() :
+                               reject(new Error(`S3 upload failed – HTTP ${xhr.status}`));
+    xhr.onerror = () => reject(new Error('network error during S3 upload'));
+    xhr.send(fd);
+  });
+  log('✅ Upload complete');
+
+  /* 3) start the background job ---------------------------------- */
+  log('🚦 /start-job …');
+  const j = await fetch('/start-job', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ s3_key: sign.s3_key, parts })
+      }).then(r => r.json());
+
+  window.location = j.stream;                      // live log page
+}
+
+/* helper ― tiny human-readable byte formatter ---------------------- */
+function prettyBytes (num) {
+  if (num < 1024) return num + ' B';
+  const units = ['KB', 'MB', 'GB', 'TB'];
+  let i = -1;
+  do { num /= 1024; ++i; } while (num >= 1024 && i < units.length - 1);
+  return num.toFixed(1) + ' ' + units[i];
 }
 </script>
-<script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
-</body>
-</html>
