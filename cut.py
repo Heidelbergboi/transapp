@@ -1,21 +1,19 @@
 #!/usr/bin/env python3
 """
-cut.py – split an MP4, write slices under /tmp/videos/clips,
-         upload each slice to S3 (clips/...), and return local paths.
-
-The caller (Flask app) uses the paths then deletes them.
+cut.py – split an MP4, write slices inside PROJECT/videos/clips
+         (so title_clips.py can immediately find them),
+         upload each slice to S3, and return local paths.
 """
 from __future__ import annotations
-import argparse, math, os, subprocess, sys, json, tempfile, shutil
+import argparse, math, os, subprocess, sys, json, shutil
 from pathlib import Path
 
 try: sys.stdout.reconfigure(encoding="utf-8")
 except Exception: pass
 
-# project root = transapp/
-PROJECT   = Path(__file__).resolve().parent.parent
-TMP_ROOT  = Path(tempfile.gettempdir()) / "videos" / "clips"
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+PROJECT  = Path(__file__).resolve().parent.parent   # transapp/
+CLIP_DIR = PROJECT / "videos" / "clips"
+CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
 FFMPEG  = os.getenv("FFMPEG_BINARY", "ffmpeg")
 FFPROBE = Path(FFMPEG).with_name(
@@ -25,24 +23,24 @@ FFPROBE = Path(FFMPEG).with_name(
 from s3_utils import upload_file
 S3_PREFIX = "clips/"
 
-def duration(path: Path) -> float:
+def duration(p:Path)->float:
     cmd=[FFPROBE,"-v","error","-show_entries","format=duration",
-         "-of","csv=p=0",str(path)]
+         "-of","csv=p=0",str(p)]
     return float(subprocess.check_output(cmd,text=True))
 
-def split(src: Path, parts:int|None=None, interval:float|None=None)->list[str]:
+def split(src:Path, parts:int|None=None, interval:float|None=None)->list[str]:
     if not src.exists(): raise FileNotFoundError(src)
     total=duration(src)
     if parts: seg=total/parts
     elif interval: parts=math.ceil(total/interval); seg=interval
-    else: raise ValueError("need --parts or --interval")
+    else: raise ValueError("give --parts or --interval")
 
     print(f"[i] {src.name}: {total/60:.2f} min → {parts} slices × {seg:.1f}s")
     paths=[]
     base,ext=src.stem,src.suffix
     for i in range(parts):
         start=i*seg; length=min(seg,total-start)
-        out=TMP_ROOT/f"{base}_part{i+1}{ext}"
+        out=CLIP_DIR/f"{base}_part{i+1}{ext}"
         cmd=[FFMPEG,"-hide_banner","-loglevel","error",
              "-ss",str(start),"-i",str(src),"-t",str(length),
              "-c:v","copy","-c:a","aac","-b:a","64k",str(out)]
@@ -62,5 +60,4 @@ def _cli():
 
 if __name__=="__main__":
     a=_cli()
-    out_list=split(a.video.resolve(),parts=a.parts,interval=a.interval)
-    print(json.dumps(out_list))
+    print(json.dumps(split(a.video.resolve(),parts=a.parts,interval=a.interval)))
