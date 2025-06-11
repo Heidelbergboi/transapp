@@ -1,146 +1,94 @@
 #!/usr/bin/env python3
 """
-title_clips.py
-──────────────
-Iterate over each .mp4 in videos/clips, be sure audio exists (add silence
-if needed), send to GPT-4o mini Transcribe, ask GPT-3.5 for a short Albanian title,
-save results to logs/clip_titles_<timestamp>.csv.
+title_clips.py – generate Albanian titles for every .mp4 in videos/clips,
+                 write a CSV under logs/, then delete those clips locally.
 """
-
 from __future__ import annotations
-import csv, os, subprocess, tempfile, sys, datetime
+import csv, os, subprocess, tempfile, sys, datetime, logging, shutil
 from pathlib import Path
+from dotenv import load_dotenv
 
-import dotenv, openai
-from tqdm import tqdm
+load_dotenv(".env")
+from openai import OpenAI
+client=OpenAI(api_key=os.getenv("OPENAI_API_KEY"),
+              project=os.getenv("OPENAI_PROJECT_ID"))
 
-# ── console (ASCII fallback) ────────────────────────────────────────────
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-    ARROW, WARN = "->", "WARNING"
-except Exception:
-    ARROW, WARN = "->", "WARNING"
-
-# ── paths ----------------------------------------------------------------
 BASE      = Path(__file__).resolve().parent
-CLIPS     = BASE / "videos" / "clips"
+CLIP_DIR  = BASE / "videos" / "clips"
 LOG_DIR   = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
 
-# load environment variables from .env
-dotenv.load_dotenv(BASE / ".env", override=True)
-
-# ffmpeg / ffprobe binaries
-FFMPEG  = os.getenv("FFMPEG_BINARY", "ffmpeg")
-def ffprobe_bin() -> str:
-    p = Path(FFMPEG)
-    probe = p.with_name("ffprobe.exe" if p.suffix.lower()==".exe" else "ffprobe")
-    return str(probe) if probe.exists() else "ffprobe"
-FFPROBE = ffprobe_bin()
-
-# OpenAI API key
-openai.api_key = os.getenv("OPENAI_API_KEY", "")
-if not openai.api_key:
-    sys.exit(f"{WARN}: OPENAI_API_KEY not set in environment")
-
-# system prompt for title generation
-SYSTEM_MSG = (
-    "Je një asistent që sugjeron tituj shumë të shkurtër (2–7 fjalë), "
-    "në shqip, sensacionalë por korrektë, bazuar në transkriptin e klipit."
+FFMPEG  = os.getenv("FFMPEG_BINARY","ffmpeg")
+FFPROBE = Path(FFMPEG).with_name(
+    "ffprobe.exe" if Path(FFMPEG).suffix.lower()==".exe" else "ffprobe"
 )
 
-def albanian_title(text: str) -> str:
-    prompt = (
-        "Bazuar në transkriptin më poshtë, propozo një titull të shkurtër "
-        "(2–7 fjalë), pa thonjëza.\n\n" + text
-    )
-    r = openai.chat.completions.create(
-        model="gpt-4",
-        temperature=0.6,
-        messages=[
-            {"role": "system", "content": SYSTEM_MSG},
-            {"role": "user",   "content": prompt},
-        ],
-    )
-    return r.choices[0].message.content.strip()
+logging.basicConfig(level=logging.INFO,
+                    format="%(levelname)s title -> %(message)s")
 
-# ── audio helpers --------------------------------------------------------
-def has_audio(path: Path) -> bool:
-    cmd = [
-        FFPROBE, "-v", "error", "-select_streams", "a",
-        "-show_entries", "stream=index", "-of", "csv=p=0", str(path)
-    ]
-    out = subprocess.run(cmd, capture_output=True, text=True).stdout.strip()
-    return bool(out)
+SYSTEM = ("Je një asistent që sugjeron tituj shumë të shkurtër (2–7 fjalë), "
+          "në shqip, sensacionalë por korrektë, bazuar në transkriptin e klipit.")
 
-def duration_sec(path: Path) -> float:
-    cmd = [
-        FFPROBE, "-v", "error",
-        "-show_entries", "format=duration", "-of", "csv=p=0", str(path)
-    ]
-    return float(subprocess.check_output(cmd, text=True).strip())
+def has_audio(p:Path)->bool:
+    cmd=[FFPROBE,"-v","error","-select_streams","a",
+         "-show_entries","stream=index","-of","csv=p=0",str(p)]
+    return bool(subprocess.check_output(cmd,text=True).strip())
 
-def extract_ogg(mp4: Path) -> Path:
-    tmp = Path(tempfile.mktemp(suffix=".ogg"))
+def dur(p:Path)->float:
+    cmd=[FFPROBE,"-v","error","-show_entries","format=duration",
+         "-of","csv=p=0",str(p)]
+    return float(subprocess.check_output(cmd,text=True))
+
+def to_ogg(mp4:Path)->Path:
+    ogg=Path(tempfile.mktemp(suffix=".ogg"))
     if has_audio(mp4):
-        cmd = [
-            FFMPEG, "-loglevel", "error", "-i", str(mp4),
-            "-vn", "-ac", "1", "-ar", "16000", "-b:a", "32k",
-            "-y", str(tmp)
-        ]
+        cmd=[FFMPEG,"-loglevel","error","-i",str(mp4),
+             "-vn","-ac","1","-ar","16000","-b:a","32k","-y",str(ogg)]
     else:
-        dur = duration_sec(mp4)
-        cmd = [
-            FFMPEG, "-loglevel", "error", "-f", "lavfi", "-t", f"{dur}",
-            "-i", "anullsrc=r=16000:cl=mono", "-b:a", "32k",
-            "-y", str(tmp)
-        ]
-    subprocess.check_call(cmd)
-    return tmp
+        cmd=[FFMPEG,"-loglevel","error","-f","lavfi",
+             "-t",str(dur(mp4)),
+             "-i","anullsrc=r=16000:cl=mono","-b:a","32k","-y",str(ogg)]
+    subprocess.check_call(cmd); return ogg
 
-# ── processing -----------------------------------------------------------
-def process_clip(mp4: Path) -> tuple[str, str] | None:
+def title(mp4:Path)->str|None:
     try:
-        ogg = extract_ogg(mp4)
+        ogg=to_ogg(mp4)
         with ogg.open("rb") as fh:
-            # use GPT-4o mini Transcribe for speech-to-text
-            txt = openai.audio.transcriptions.create(
-                model="gpt-4o-mini-transcribe",
-                file=fh,
-                response_format="text",
-                temperature=0.0,
-            ).strip()
-        title = albanian_title(txt)
-        return mp4.name, title
-    except Exception as exc:
-        print(f"{WARN}: Skipped {mp4.name} – {exc}")
+            text=client.audio.transcriptions.create(
+                    model="whisper-1",file=fh,
+                    response_format="text").strip()
+        if not text: return None
+        prompt=("Bazuar në transkriptin më poshtë, propozo një titull "
+                "shumë të shkurtër (2–7 fjalë), pa thonjëza.\n\n"+text)
+        r=client.chat.completions.create(
+              model="gpt-3.5-turbo",temperature=0.6,
+              messages=[{"role":"system","content":SYSTEM},
+                        {"role":"user","content":prompt}],timeout=15)
+        return r.choices[0].message.content.strip()
+    except Exception as e:
+        logging.error("%s failed – %s", mp4.name, e)
         return None
     finally:
-        try:
-            ogg.unlink(missing_ok=True)  # remove temp file
-        except Exception:
-            pass
+        try: ogg.unlink(missing_ok=True)
+        except Exception: pass
 
-def main() -> None:
-    clips = sorted(CLIPS.glob("*.mp4"))
-    if not clips:
-        print("No clips found in", CLIPS)
-        return
+def main():
+    mp4s=list(CLIP_DIR.glob("*.mp4"))
+    if not mp4s:
+        print("No clips in",CLIP_DIR); return
+    rows=[]
+    for m in mp4s:
+        logging.info("processing %s",m.name)
+        t=title(m)
+        if t: rows.append((m.name,t))
+        m.unlink(missing_ok=True)        # keep host disk clean
+    ts=datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    out=LOG_DIR/f"clip_titles_{ts}.csv"
+    with out.open("w",newline="",encoding="utf-8") as f:
+        w=csv.writer(f); w.writerow(("file","title")); w.writerows(rows)
+        if not rows:
+            w.writerow(("# Asnjë titull nuk u gjenerua – shiko logs",))
+    # ascii-only tick mark to avoid Windows cp1252 error
+    print("[OK] Titles saved ->", out)
 
-    rows: list[tuple[str, str]] = []
-    print(f"Processing {len(clips)} clip(s)…\n")
-    for mp4 in tqdm(clips, unit="clip"):
-        res = process_clip(mp4)
-        if res:
-            rows.append(res)
-
-    ts = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    out = LOG_DIR / f"clip_titles_{ts}.csv"
-    with out.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f)
-        writer.writerow(("file", "title"))
-        writer.writerows(rows)
-
-    print(f"\n[✓] Titles saved {ARROW} {out}")
-
-if __name__ == "__main__":
+if __name__=="__main__":
     main()
