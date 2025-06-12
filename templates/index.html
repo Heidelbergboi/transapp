@@ -81,14 +81,22 @@ async function uploadSinglePost (file, sign) {
   await new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', sign.url, true);
+
     xhr.upload.onprogress = ev => {
       if (!ev.lengthComputable) return;
       const pct = (ev.loaded / ev.total * 100).toFixed(1);
       log(`   … ${pct}% (${pretty(ev.loaded)} / ${pretty(ev.total)})`);
     };
-    xhr.onload  = () => xhr.status === 204 ? resolve()
-                                          : reject(new Error('S3 POST failed'));
-    xhr.onerror = () => reject(new Error('network error during S3 POST'));
+
+    xhr.onload  = () => {
+      if (xhr.status === 204) return resolve();
+      log(`❌ S3 responded ${xhr.status}`);
+      reject(new Error(`S3 POST failed – HTTP ${xhr.status}`));
+    };
+    xhr.onerror = () => {
+      log('❌ Network or CORS error');
+      reject(new Error('network/CORS error during S3 POST'));
+    };
     xhr.send(fd);
   });
   log('✅ Upload complete');
@@ -111,7 +119,7 @@ async function uploadMultipart (file, meta) {
     log(`   … part ${i+1}/${part_urls.length} ok`);
   })()));
 
-  /* complete */
+  /* complete upload */
   const body = `<CompleteMultipartUpload>${
       etags.map(e=>`<Part><ETag>${e.ETag}</ETag><PartNumber>${e.PartNumber}</PartNumber></Part>`).join('')
     }</CompleteMultipartUpload>`;
