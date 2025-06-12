@@ -1,22 +1,20 @@
 #!/usr/bin/env python3
 from __future__ import annotations
 
-import os, re, subprocess, uuid, sys, csv, shutil, time, logging, datetime
+import os, subprocess, uuid, sys, csv, shutil, time, logging, datetime
 from pathlib import Path
 from flask import (
-    Flask, render_template, request, url_for,
-    stream_with_context, Response, send_from_directory, jsonify
+    Flask, render_template, request, url_for, Response,
+    stream_with_context, send_from_directory, jsonify
 )
 from dotenv import load_dotenv
-from s3_utils import (
-    presign_single_post, presign_multipart, download_to_temp
-)
+from s3_utils import presign_single_post, presign_multipart, download_to_temp
 
 # ── paths & logging ──────────────────────────────────────────────────
 BASE    = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 
-LOG_DIR = BASE / "logs";           LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR = BASE / "logs";            LOG_DIR.mkdir(exist_ok=True)
 CLIPS   = BASE / "videos" / "clips"; CLIPS.mkdir(parents=True, exist_ok=True)
 
 logging.basicConfig(
@@ -38,14 +36,14 @@ PYTHON       = sys.executable
 app            = Flask(__name__, template_folder="templates")
 app.secret_key = os.getenv("SECRET_KEY", "dev")
 
-# in-memory job map (OK for single-instance demo)
+# in-memory job map (demo only)
 JOBS: dict[str, dict] = {}
 
 # ── routes ───────────────────────────────────────────────────────────
 @app.route("/")
 def index(): return render_template("index.html")
 
-@app.route("/ping")                       # ← keep-alive endpoint
+@app.route("/ping")                       # keep-alive for Render
 def ping(): return ("", 204)
 
 @app.route("/sign", methods=["POST"])
@@ -53,12 +51,10 @@ def sign():
     data     = request.get_json(force=True)
     filename = data["filename"]
     size     = int(data.get("size", 0))
-
-    if size > 100 * 1024 * 1024:
-        resp = presign_multipart(filename, size)
-    else:
-        resp = presign_single_post(filename)
-    return jsonify(resp)
+    return jsonify(
+        presign_multipart(filename, size) if size > 100*1024*1024
+        else presign_single_post(filename)
+    )
 
 @app.route("/start-job", methods=["POST"])
 def start_job():
@@ -74,7 +70,8 @@ def stream_page(job_id): return render_template("stream.html", job_id=job_id)
 @app.route("/stream_raw/<job_id>")
 def stream_raw(job_id):
     job = JOBS.pop(job_id, {})
-    if not job: return Response("job not found\n", mimetype="text/plain")
+    if not job:
+        return Response("job not found\n", mimetype="text/plain")
 
     @stream_with_context
     def gen():
@@ -94,7 +91,8 @@ def stream_raw(job_id):
 
             yield "\n💬 Gjenerimi i titujve…\n"
             t1 = time.perf_counter()
-            for ln in _run([PYTHON, TITLE_SCRIPT]): yield ln + "\n"
+            for ln in _run([PYTHON, TITLE_SCRIPT]):
+                yield ln + "\n"
             log.info("title %.1fs", time.perf_counter() - t1)
 
             yield "\n🎉 FINISHED\n"; log.info("JOB %s OK", job_id)
@@ -107,17 +105,17 @@ def stream_raw(job_id):
 def done():
     csvs = sorted(LOG_DIR.glob("clip_titles_*.csv"),
                   key=lambda p: p.stat().st_mtime, reverse=True)
-    clips, msg = [], None
+    clips = []
     if csvs:
         with csvs[0].open(encoding="utf-8") as fh:
             clips = list(csv.DictReader(fh))
-    return render_template("done.html", clips=clips, msg=msg)
+    return render_template("done.html", clips=clips, msg=None)
 
 @app.route("/clips/<path:filename>")
 def serve_clip(filename):
     return send_from_directory(CLIPS, filename)
 
-# ── helper ──────────────────────────────────────────────────────────
+# ── helpers ──────────────────────────────────────────────────────────
 def _run(cmd):
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True) as p:
