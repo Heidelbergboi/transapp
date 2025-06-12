@@ -1,4 +1,3 @@
-<!-- templates/index.html  (TransApp upload page with progress bar) -->
 <!DOCTYPE html>
 <html lang="sq">
 <head>
@@ -31,61 +30,99 @@
 </div>
 
 <script>
-async function upload () {
-  const file   = document.getElementById('file').files[0];
-  const parts  = document.getElementById('parts').value || 5;
-  const log    = t => (document.getElementById('log').textContent += t + '\n');
+/* ── helpers ────────────────────────────────────────────── */
+const log = t => (document.getElementById('log').textContent += t + '\n');
+const pretty = n => {
+  if (n < 1024) return n + ' B';
+  const units = ['KB','MB','GB','TB']; let i = -1;
+  do { n /= 1024; ++i; } while (n >= 1024 && i < units.length-1);
+  return n.toFixed(1) + ' ' + units[i];
+};
 
+/* ── main orchestrator ──────────────────────────────────── */
+async function upload () {
+  const file  = document.getElementById('file').files[0];
+  const parts = document.getElementById('parts').value || 5;
   if (!file) { alert('Zgjidhni një MP4'); return; }
 
   /* 1) presign ---------------------------------------------------- */
   log('🚦 /sign …');
   const sign = await fetch('/sign', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ filename: file.name })
-      }).then(r => r.json());
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ filename:file.name, size:file.size })
+      }).then(r=>r.json());
 
-  /* 2) direct POST to S3 (with progress) -------------------------- */
+  /* 2) upload ----------------------------------------------------- */
+  if (sign.multipart) {
+    await uploadMultipart(file, sign);
+  } else {
+    await uploadSinglePost(file, sign);
+  }
+
+  /* 3) fire the back-end job -------------------------------------- */
+  log('🚦 /start-job …');
+  const j = await fetch('/start-job', {
+        method:'POST',
+        headers:{'Content-Type':'application/json'},
+        body:JSON.stringify({ s3_key: sign.s3_key, parts })
+      }).then(r=>r.json());
+
+  window.location = j.stream;
+}
+
+/* ── single POST (≤100 MB) ───────────────────────────────── */
+async function uploadSinglePost (file, sign) {
   const fd = new FormData();
-  Object.entries(sign.fields).forEach(([k,v]) => fd.append(k,v));
-  fd.append('file', file);                         // MUST be last
+  Object.entries(sign.fields).forEach(([k,v])=>fd.append(k,v));
+  fd.append('file', file);
 
-  log(`⬆️  Uploading ${prettyBytes(file.size)} to S3…`);
+  log(`⬆️  Uploading ${pretty(file.size)} to S3 (single POST)…`);
   await new Promise((resolve, reject) => {
     const xhr = new XMLHttpRequest();
     xhr.open('POST', sign.url, true);
-
     xhr.upload.onprogress = ev => {
       if (!ev.lengthComputable) return;
       const pct = (ev.loaded / ev.total * 100).toFixed(1);
-      log(`   … ${pct}% (${prettyBytes(ev.loaded)} / ${prettyBytes(ev.total)})`);
+      log(`   … ${pct}% (${pretty(ev.loaded)} / ${pretty(ev.total)})`);
     };
-
     xhr.onload  = () => xhr.status === 204 ? resolve()
-                                          : reject(new Error(`S3 upload failed – HTTP ${xhr.status}`));
-    xhr.onerror = () => reject(new Error('network error during S3 upload'));
+                                          : reject(new Error('S3 POST failed'));
+    xhr.onerror = () => reject(new Error('network error during S3 POST'));
     xhr.send(fd);
   });
   log('✅ Upload complete');
-
-  /* 3) start the background job ---------------------------------- */
-  log('🚦 /start-job …');
-  const j = await fetch('/start-job', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ s3_key: sign.s3_key, parts })
-      }).then(r => r.json());
-
-  window.location = j.stream;                      // live log page
 }
 
-/* helper ― human-readable byte formatter ------------------------- */
-function prettyBytes (num) {
-  if (num < 1024) return num + ' B';
-  const units = ['KB','MB','GB','TB']; let i = -1;
-  do { num /= 1024; ++i; } while (num >= 1024 && i < units.length-1);
-  return num.toFixed(1) + ' ' + units[i];
+/* ── multipart PUT (>100 MB) ─────────────────────────────── */
+async function uploadMultipart (file, meta) {
+  const { part_urls, complete_url, part_mb } = meta;
+  const partSize = part_mb * 1024 * 1024;
+  const etags = Array(part_urls.length);
+
+  log(`⬆️  Multipart upload ${part_urls.length}×${part_mb} MB…`);
+
+  await Promise.all(part_urls.map((url,i)=> (async()=>{
+    const start = i * partSize;
+    const blob  = file.slice(start, Math.min(start+partSize, file.size));
+    const r     = await fetch(url, {method:'PUT', body:blob});
+    if(!r.ok) throw new Error('part '+(i+1)+' failed');
+    etags[i] = {ETag:r.headers.get('ETag'), PartNumber:i+1};
+    log(`   … part ${i+1}/${part_urls.length} ok`);
+  })()));
+
+  /* complete */
+  const body = `<CompleteMultipartUpload>${
+      etags.map(e=>`<Part><ETag>${e.ETag}</ETag><PartNumber>${e.PartNumber}</PartNumber></Part>`).join('')
+    }</CompleteMultipartUpload>`;
+
+  const done = await fetch(complete_url, {
+        method:'POST',
+        headers:{'Content-Type':'application/xml'},
+        body
+      });
+  if(!done.ok) throw new Error('complete failed');
+  log('✅ Upload complete');
 }
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
