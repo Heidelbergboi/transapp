@@ -15,7 +15,7 @@ load_dotenv(BASE / ".env")
 
 LOG_DIR      = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
 DEFAULT_DIR  = BASE / "videos" / "clips"
-CLIPS        = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))     # 🔸 new
+CLIPS        = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))  # uses /var/data/clips
 CUT_SCRIPT   = str(BASE / "cut.py")
 TITLE_SCRIPT = str(BASE / "title_clips.py")
 PYTHON       = sys.executable
@@ -39,20 +39,17 @@ app.secret_key = os.getenv("SECRET_KEY", "dev")
 
 JOBS: dict[str, dict] = {}
 
-# ── routes ───────────────────────────────────────────────────────────
 @app.route("/")
-def index():
-    return render_template("index.html")
+def index(): return render_template("index.html")
 
-@app.route("/ping")                   # keep-alive for Render free tier
-def ping():
-    return ("", 204)
+@app.route("/ping")
+def ping(): return ("", 204)
 
 @app.route("/sign", methods=["POST"])
 def sign():
-    d   = request.get_json(force=True)
-    fn  = d["filename"]
+    d    = request.get_json(force=True)
     size = int(d["size"])
+    fn   = d["filename"]
     return jsonify(
         presign_multipart(fn, size) if size > 100 * 1024 * 1024
         else presign_single_post(fn)
@@ -81,9 +78,8 @@ def stream_raw(job_id):
         s3key, parts = job["s3_key"], job["parts"]
         src: Path | None = None
         try:
-            log.info("JOB %s start  parts=%s  s3=%s", job_id, parts, s3key)
+            log.info("JOB %s start parts=%s s3=%s", job_id, parts, s3key)
 
-            # fresh workspace each run
             shutil.rmtree(CLIPS, ignore_errors=True)
             CLIPS.mkdir(parents=True, exist_ok=True)
 
@@ -129,7 +125,7 @@ def done():
 def serve_clip(filename):
     return send_from_directory(CLIPS, filename)
 
-# ── helper: stream subprocess output ─────────────────────────────────
+# ── helper ───────────────────────────────────────────────────────────
 def _run(cmd):
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True) as p:

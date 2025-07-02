@@ -1,18 +1,18 @@
 #!/usr/bin/env python3
 """
-cut.py – split an MP4, write slices to $CLIPS_DIR (default videos/clips),
-upload each slice to S3, and print local paths as JSON.
+cut.py – split an MP4, save slices into $CLIPS_DIR (default videos/clips),
+         upload each slice to S3, and print JSON list of paths.
 """
 from __future__ import annotations
 import argparse, math, os, subprocess, sys, json
 from pathlib import Path
 from shutil import which
-from s3_utils import upload_file   # your existing helper
+from s3_utils import upload_file
 
 # ── env & paths ───────────────────────────────────────────────────────
-PROJECT     = Path(__file__).resolve().parent
-DEFAULT_DIR = PROJECT / "videos" / "clips"
-CLIP_DIR    = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))
+PROJECT      = Path(__file__).resolve().parent
+DEFAULT_DIR  = PROJECT / "videos" / "clips"
+CLIP_DIR     = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))
 CLIP_DIR.mkdir(parents=True, exist_ok=True)
 
 S3_PREFIX = "clips/"
@@ -36,20 +36,20 @@ def split(src: Path, *, parts: int | None = None,
           interval: float | None = None) -> list[str]:
     if not src.exists():
         raise FileNotFoundError(src)
-    tot = _duration(src)
+    total = _duration(src)
     if parts:
-        seg = tot / parts
+        seg = total / parts
     elif interval:
-        parts = math.ceil(tot / interval)
+        parts = math.ceil(total / interval)
         seg   = interval
     else:
         raise ValueError("give --parts or --interval")
 
-    print(f"[i] {src.name}: {tot/60:.2f} min → {parts} slices × {seg:.1f}s")
+    print(f"[i] {src.name}: {total/60:.2f} min → {parts} slices × {seg:.1f}s")
     paths: list[str] = []
     for i in range(parts):
         start  = i * seg
-        length = min(seg, tot - start)
+        length = min(seg, total - start)
         out    = CLIP_DIR / f"{src.stem}_part{i+1}{src.suffix}"
         cmd = [
             FFMPEG, "-hide_banner", "-loglevel", "error",
@@ -62,7 +62,7 @@ def split(src: Path, *, parts: int | None = None,
         paths.append(str(out))
     return paths
 
-# ── CLI wrapper ───────────────────────────────────────────────────────
+# ── CLI ───────────────────────────────────────────────────────────────
 def _cli():
     p = argparse.ArgumentParser()
     p.add_argument("video", type=Path)

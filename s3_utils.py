@@ -1,10 +1,8 @@
 #!/usr/bin/env python3
 """
-s3_utils.py  –  single-POST (≤100 MB) and multipart (>100 MB) presign helpers,
-plus thin wrappers to upload/download objects.  Now:
- • writes temp files in TMPDIR (Render disk)
- • uses 32 MB parts to cut presign chatter in half
- • falls back gracefully if Transfer Acceleration is off
+s3_utils.py – presign helpers + tiny upload/download wrappers.
+Now returns both snake_case AND camelCase keys so the existing JS
+upload code works unmodified.
 """
 from __future__ import annotations
 import os, math, tempfile, uuid, logging
@@ -13,22 +11,18 @@ import boto3
 from botocore.client import Config
 from botocore.exceptions import ClientError
 
-log = logging.getLogger("s3_utils")
-
-# ── env & constants ───────────────────────────────────────────────────
+# ── env / constants ──────────────────────────────────────────────────
 BUCKET   = os.getenv("S3_BUCKET")
 REGION   = os.getenv("AWS_REGION", "eu-south-1")
 ACCEL_ON = os.getenv("S3_ACCEL", "0") == "1"
-PART_MB  = int(os.getenv("PART_MB", 32))          # ← was 8 MB
+PART_MB  = int(os.getenv("PART_MB", 32))
 
 if not BUCKET:
     raise RuntimeError("S3_BUCKET env var missing")
 
-# scratch dir lives on the 10 GB Render disk
 TMP_ROOT = Path(os.getenv("TMPDIR", "/tmp"))
 TMP_ROOT.mkdir(parents=True, exist_ok=True)
 
-# Boto3 clients
 _session = boto3.session.Session(
     aws_access_key_id     = os.getenv("AWS_ACCESS_KEY_ID"),
     aws_secret_access_key = os.getenv("AWS_SECRET_ACCESS_KEY"),
@@ -38,9 +32,9 @@ s3  = _session.client("s3")
 acc = _session.client("s3",
         config=Config(s3={"use_accelerate_endpoint": ACCEL_ON}))
 
-# ── presign helpers ───────────────────────────────────────────────────
+# ── presign helpers ──────────────────────────────────────────────────
 def presign_single_post(filename: str, expires: int = 3600) -> dict:
-    """For files ≤ 100 MB – HTML form upload."""
+    """≤ 100 MB direct form POST."""
     key  = f"full/{filename}"
     post = s3.generate_presigned_post(
         Bucket     = BUCKET,
@@ -52,28 +46,31 @@ def presign_single_post(filename: str, expires: int = 3600) -> dict:
             ["content-length-range", 0, 5_368_709_120],
         ],
     )
-    post.setdefault("url", f"https://{BUCKET}.s3.{REGION}.amazonaws.com")
-    return dict(**post, multipart=False, s3_key=key)
+    post.setdefault("url",
+        f"https://{BUCKET}.s3.{REGION}.amazonaws.com")
+    return {
+        **post,
+        "multipart": False,
+        "s3_key"   : key,   # backend
+        "key"      : key,   # frontend (camel-case)
+    }
 
 def presign_multipart(filename: str, size: int, expires: int = 3600) -> dict:
-    """For > 100 MB uploads – many presigned PUT URLs."""
+    """> 100 MB multipart PUTs."""
     key   = f"full/{filename}"
     parts = math.ceil(size / (PART_MB * 1_048_576))
 
-    # 1) try accelerated endpoint if opted-in
     client_for_urls = acc
     try:
         resp = acc.create_multipart_upload(Bucket=BUCKET, Key=key)
     except ClientError as e:
         if ACCEL_ON and e.response["Error"]["Code"] == "InvalidRequest":
-            log.warning("Transfer Acceleration disabled – falling back")
             client_for_urls = s3
             resp            = s3.create_multipart_upload(Bucket=BUCKET, Key=key)
         else:
             raise
 
     upload_id = resp["UploadId"]
-
     part_urls = [
         client_for_urls.generate_presigned_url(
             "upload_part",
@@ -88,7 +85,6 @@ def presign_multipart(filename: str, size: int, expires: int = 3600) -> dict:
         )
         for i in range(1, parts + 1)
     ]
-
     complete_url = client_for_urls.generate_presigned_url(
         "complete_multipart_upload",
         Params     = {"Bucket": BUCKET, "Key": key, "UploadId": upload_id},
@@ -96,22 +92,25 @@ def presign_multipart(filename: str, size: int, expires: int = 3600) -> dict:
         HttpMethod = "POST",
     )
 
-    return dict(
-        multipart    = True,
-        upload_id    = upload_id,
-        s3_key       = key,
-        part_mb      = PART_MB,
-        part_urls    = part_urls,
-        complete_url = complete_url,
-    )
+    return {
+        "multipart"   : True,
+        "upload_id"   : upload_id,     # snake
+        "uploadId"    : upload_id,     # camel
+        "s3_key"      : key,
+        "key"         : key,
+        "part_mb"     : PART_MB,
+        "part_urls"   : part_urls,     # snake
+        "partUrls"    : part_urls,     # camel
+        "complete_url": complete_url,
+        "completeUrl" : complete_url,
+    }
 
-# ── convenience wrappers ──────────────────────────────────────────────
+# ── small wrappers ───────────────────────────────────────────────────
 def upload_file(local: Path, key: str) -> str:
     s3.upload_file(str(local), BUCKET, key)
     return key
 
 def download_to_temp(key: str) -> Path:
-    """Pull <key> to the tmp disk; return its local path."""
     tmp = TMP_ROOT / f"{uuid.uuid4().hex}__{Path(key).name}"
     s3.download_file(BUCKET, key, str(tmp))
     return tmp

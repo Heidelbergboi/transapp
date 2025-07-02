@@ -1,9 +1,6 @@
 #!/usr/bin/env python3
 """
-title_clips.py – whisper → short Albanian titles.
-• Reads clips from $CLIPS_DIR  (falls back to videos/clips)
-• Logs “no speech” cases
-• Outputs CSV in ./logs
+title_clips.py – generate Albanian titles for every clip in $CLIPS_DIR.
 """
 from __future__ import annotations
 import os, csv, subprocess, tempfile, datetime, logging, sys
@@ -11,25 +8,23 @@ from pathlib import Path
 from shutil import which
 from dotenv import load_dotenv
 
-# ── environment & paths ───────────────────────────────────────────────
+# ── env & paths ───────────────────────────────────────────────────────
 BASE        = Path(__file__).resolve().parent
 DEFAULT_DIR = BASE / "videos" / "clips"
 CLIPS_DIR   = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
 
-LOG_DIR = BASE / "logs"
-LOG_DIR.mkdir(exist_ok=True)
-
+LOG_DIR = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
 load_dotenv(BASE / ".env")
 
 # ── OpenAI client ─────────────────────────────────────────────────────
 from openai import OpenAI
 client = OpenAI(
-    api_key   = os.getenv("OPENAI_API_KEY"),
-    project   = os.getenv("OPENAI_PROJECT_ID"),
+    api_key = os.getenv("OPENAI_API_KEY"),
+    project = os.getenv("OPENAI_PROJECT_ID"),
 )
 
-# ── ffmpeg / ffprobe helpers ─────────────────────────────────────────
+# ── ffmpeg helpers ────────────────────────────────────────────────────
 FFMPEG_ENV = os.getenv("FFMPEG_BINARY")
 FFMPEG  = FFMPEG_ENV if FFMPEG_ENV and Path(FFMPEG_ENV).exists() else "ffmpeg"
 FFPROBE = Path(FFMPEG).with_name(
@@ -38,17 +33,15 @@ FFPROBE = Path(FFMPEG).with_name(
 if not which(FFMPEG):
     sys.exit("⛔  ffmpeg not found – install it in your Render build.")
 
-# ── logging -----------------------------------------------------------
 logging.basicConfig(level=logging.INFO,
                     format="%(levelname)s title → %(message)s")
 
 SYSTEM_MSG = ("Je një asistent që sugjeron tituj 2–7 fjalësh, "
               "sensacionalë por korrektë, në shqip, bazuar në transkriptin e klipit.")
 
-def _run(cmd: list[str]) -> None:
-    subprocess.check_call(cmd,
-                          stdout=subprocess.DEVNULL,
-                          stderr=subprocess.DEVNULL)
+def _run(cmd): subprocess.check_call(cmd,
+                                     stdout=subprocess.DEVNULL,
+                                     stderr=subprocess.DEVNULL)
 
 def _has_audio(p: Path) -> bool:
     out = subprocess.check_output(
@@ -79,8 +72,7 @@ def _title(mp4: Path) -> str:
         ogg = _to_ogg(mp4)
         with ogg.open("rb") as fh:
             txt = client.audio.transcriptions.create(
-                model="whisper-1",
-                file=fh,
+                model="whisper-1", file=fh,
                 response_format="text").strip()
         if not txt:
             logging.warning("no speech → %s", mp4.name)
@@ -88,8 +80,7 @@ def _title(mp4: Path) -> str:
         prompt = ("Bazuar në transkriptin më poshtë, propozo një titull "
                   "(2–7 fjalë), pa thonjëza.\n\n" + txt)
         rsp = client.chat.completions.create(
-            model="gpt-3.5-turbo",
-            temperature=0.6,
+            model="gpt-3.5-turbo", temperature=0.6,
             messages=[{"role": "system", "content": SYSTEM_MSG},
                       {"role": "user",   "content": prompt}],
         )
@@ -103,8 +94,8 @@ def _title(mp4: Path) -> str:
         except Exception:
             pass
 
-def main() -> None:
-    rows: list[tuple[str, str]] = []
+def main():
+    rows = []
     for mp4 in sorted(CLIPS_DIR.glob("*.mp4")):
         logging.info("processing %s", mp4.name)
         rows.append((mp4.name, _title(mp4)))
