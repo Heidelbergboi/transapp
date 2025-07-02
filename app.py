@@ -7,17 +7,20 @@ from flask import (
     Response, stream_with_context, send_from_directory, jsonify
 )
 from dotenv import load_dotenv
-from s3_utils import (
-    presign_single_post, presign_multipart, download_to_temp
-)
+from s3_utils import presign_single_post, presign_multipart, download_to_temp
 
-# ── paths & logging ──────────────────────────────────────────────────
-BASE    = Path(__file__).resolve().parent
+# ── env & paths ──────────────────────────────────────────────────────
+BASE         = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 
-LOG_DIR = BASE / "logs";            LOG_DIR.mkdir(exist_ok=True)
-CLIPS   = BASE / "videos" / "clips"; CLIPS.mkdir(parents=True, exist_ok=True)
+LOG_DIR      = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
+DEFAULT_DIR  = BASE / "videos" / "clips"
+CLIPS        = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))     # 🔸 new
+CUT_SCRIPT   = str(BASE / "cut.py")
+TITLE_SCRIPT = str(BASE / "title_clips.py")
+PYTHON       = sys.executable
 
+# ── logging setup ────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s → %(message)s",
@@ -30,42 +33,42 @@ logging.basicConfig(
 )
 log = logging.getLogger("transapp")
 
-CUT_SCRIPT   = str(BASE / "cut.py")
-TITLE_SCRIPT = str(BASE / "title_clips.py")
-PYTHON       = sys.executable
-
 # ── Flask app ────────────────────────────────────────────────────────
 app            = Flask(__name__, template_folder="templates")
 app.secret_key = os.getenv("SECRET_KEY", "dev")
 
-JOBS: dict[str, dict] = {}                # in-memory job map
+JOBS: dict[str, dict] = {}
 
 # ── routes ───────────────────────────────────────────────────────────
 @app.route("/")
-def index(): return render_template("index.html")
+def index():
+    return render_template("index.html")
 
-@app.route("/ping")                       # keep-alive for Render
-def ping(): return ("", 204)
+@app.route("/ping")                   # keep-alive for Render free tier
+def ping():
+    return ("", 204)
 
 @app.route("/sign", methods=["POST"])
 def sign():
     d   = request.get_json(force=True)
-    fn  = d["filename"]; size = int(d["size"])
+    fn  = d["filename"]
+    size = int(d["size"])
     return jsonify(
-        presign_multipart(fn, size) if size > 100*1024*1024
+        presign_multipart(fn, size) if size > 100 * 1024 * 1024
         else presign_single_post(fn)
     )
 
 @app.route("/start-job", methods=["POST"])
 def start_job():
-    d = request.get_json(force=True)
+    d   = request.get_json(force=True)
     jid = uuid.uuid4().hex
     JOBS[jid] = dict(s3_key=d["s3_key"],
                      parts=max(2, int(d.get("parts", 5))))
     return jsonify(stream=url_for("stream_page", job_id=jid))
 
 @app.route("/stream/<job_id>")
-def stream_page(job_id): return render_template("stream.html", job_id=job_id)
+def stream_page(job_id):
+    return render_template("stream.html", job_id=job_id)
 
 @app.route("/stream_raw/<job_id>")
 def stream_raw(job_id):
@@ -79,7 +82,10 @@ def stream_raw(job_id):
         src: Path | None = None
         try:
             log.info("JOB %s start  parts=%s  s3=%s", job_id, parts, s3key)
-            shutil.rmtree(CLIPS, ignore_errors=True); CLIPS.mkdir(exist_ok=True)
+
+            # fresh workspace each run
+            shutil.rmtree(CLIPS, ignore_errors=True)
+            CLIPS.mkdir(parents=True, exist_ok=True)
 
             yield f"🔻 Shkarkimi nga S3: {s3key}\n"
             src = download_to_temp(s3key); yield "✅ Shkarkuar\n"
@@ -102,27 +108,28 @@ def stream_raw(job_id):
             log.exception("JOB %s failed", job_id)
             yield f"\n⛔ {e}\n"
         finally:
-            try:  # clean scratch file
-                if src and src.exists(): src.unlink(missing_ok=True)
+            try:
+                if src and src.exists():
+                    src.unlink(missing_ok=True)
             except Exception:
                 pass
     return Response(gen(), mimetype="text/plain")
 
 @app.route("/done")
 def done():
-    csvs  = sorted(LOG_DIR.glob("clip_titles_*.csv"),
-                   key=lambda p: p.stat().st_mtime, reverse=True)
+    csvs = sorted(LOG_DIR.glob("clip_titles_*.csv"),
+                  key=lambda p: p.stat().st_mtime, reverse=True)
     clips = []
     if csvs:
-        with csvs[0].open(encoding="utf-8") as f:
-            clips = list(csv.DictReader(f))
+        with csvs[0].open(encoding="utf-8") as fh:
+            clips = list(csv.DictReader(fh))
     return render_template("done.html", clips=clips)
 
 @app.route("/clips/<path:filename>")
 def serve_clip(filename):
     return send_from_directory(CLIPS, filename)
 
-# ── helper to stream subprocess output  ───────────────────────────────
+# ── helper: stream subprocess output ─────────────────────────────────
 def _run(cmd):
     with subprocess.Popen(cmd, stdout=subprocess.PIPE,
                           stderr=subprocess.STDOUT, text=True) as p:
