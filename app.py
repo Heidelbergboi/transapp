@@ -10,35 +10,37 @@ from dotenv import load_dotenv
 from s3_utils import presign_single_post, presign_multipart, download_to_temp
 
 # ── env & paths ──────────────────────────────────────────────────────
-BASE         = Path(__file__).resolve().parent
+BASE        = Path(__file__).resolve().parent
 load_dotenv(BASE / ".env")
 
-LOG_DIR      = BASE / "logs"; LOG_DIR.mkdir(exist_ok=True)
-DEFAULT_DIR  = BASE / "videos" / "clips"
-CLIPS        = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))  # uses /var/data/clips
+LOG_DIR     = BASE / "logs";            LOG_DIR.mkdir(exist_ok=True)
+DEFAULT_DIR = BASE / "videos" / "clips"
+CLIPS       = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))
+
 CUT_SCRIPT   = str(BASE / "cut.py")
 TITLE_SCRIPT = str(BASE / "title_clips.py")
 PYTHON       = sys.executable
 
-# ── logging setup ────────────────────────────────────────────────────
+# hard limit for single-POST in S3 (5 GB = 5 × 1024³)
+SINGLE_POST_MAX = 5_368_709_120
+
+# ── logging ──────────────────────────────────────────────────────────
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s %(levelname)s → %(message)s",
-    handlers=[
-        logging.FileHandler(
-            LOG_DIR / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.log",
-            encoding="utf-8"),
-        logging.StreamHandler(sys.stdout),
-    ],
+    handlers=[logging.FileHandler(
+                 LOG_DIR / f"run_{datetime.datetime.now():%Y%m%d_%H%M%S}.log",
+                 encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("transapp")
 
-# ── Flask app ────────────────────────────────────────────────────────
+# ── Flask app setup ──────────────────────────────────────────────────
 app            = Flask(__name__, template_folder="templates")
 app.secret_key = os.getenv("SECRET_KEY", "dev")
-
 JOBS: dict[str, dict] = {}
 
+# ── routes ───────────────────────────────────────────────────────────
 @app.route("/")
 def index(): return render_template("index.html")
 
@@ -47,13 +49,15 @@ def ping(): return ("", 204)
 
 @app.route("/sign", methods=["POST"])
 def sign():
-    d    = request.get_json(force=True)
-    size = int(d["size"])
-    fn   = d["filename"]
-    return jsonify(
-        presign_multipart(fn, size) if size > 100 * 1024 * 1024
-        else presign_single_post(fn)
-    )
+    """Return a presign for <=5 GB (single POST) or multipart above that."""
+    data = request.get_json(force=True)
+    size = int(data["size"])
+    fn   = data["filename"]
+
+    if size <= SINGLE_POST_MAX:
+        return jsonify(presign_single_post(fn))
+    else:
+        return jsonify(presign_multipart(fn, size))
 
 @app.route("/start-job", methods=["POST"])
 def start_job():
@@ -64,9 +68,9 @@ def start_job():
     return jsonify(stream=url_for("stream_page", job_id=jid))
 
 @app.route("/stream/<job_id>")
-def stream_page(job_id):
-    return render_template("stream.html", job_id=job_id)
+def stream_page(job_id): return render_template("stream.html", job_id=job_id)
 
+# ── long-running stream worker ───────────────────────────────────────
 @app.route("/stream_raw/<job_id>")
 def stream_raw(job_id):
     job = JOBS.pop(job_id, None)
@@ -79,9 +83,7 @@ def stream_raw(job_id):
         src: Path | None = None
         try:
             log.info("JOB %s start parts=%s s3=%s", job_id, parts, s3key)
-
-            shutil.rmtree(CLIPS, ignore_errors=True)
-            CLIPS.mkdir(parents=True, exist_ok=True)
+            shutil.rmtree(CLIPS, ignore_errors=True); CLIPS.mkdir(parents=True)
 
             yield f"🔻 Shkarkimi nga S3: {s3key}\n"
             src = download_to_temp(s3key); yield "✅ Shkarkuar\n"
@@ -95,8 +97,7 @@ def stream_raw(job_id):
 
             yield "\n💬 Gjenerimi i titujve…\n"
             t1 = time.perf_counter()
-            for ln in _run([PYTHON, TITLE_SCRIPT]):
-                yield ln + "\n"
+            for ln in _run([PYTHON, TITLE_SCRIPT]): yield ln + "\n"
             log.info("title %.1fs", time.perf_counter() - t1)
 
             yield "\n🎉 FINISHED\n"; log.info("JOB %s OK", job_id)
@@ -104,11 +105,8 @@ def stream_raw(job_id):
             log.exception("JOB %s failed", job_id)
             yield f"\n⛔ {e}\n"
         finally:
-            try:
-                if src and src.exists():
-                    src.unlink(missing_ok=True)
-            except Exception:
-                pass
+            try: src and src.unlink(missing_ok=True)
+            except Exception: pass
     return Response(gen(), mimetype="text/plain")
 
 @app.route("/done")
@@ -122,8 +120,7 @@ def done():
     return render_template("done.html", clips=clips)
 
 @app.route("/clips/<path:filename>")
-def serve_clip(filename):
-    return send_from_directory(CLIPS, filename)
+def serve_clip(filename): return send_from_directory(CLIPS, filename)
 
 # ── helper ───────────────────────────────────────────────────────────
 def _run(cmd):

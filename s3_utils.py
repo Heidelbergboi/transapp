@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
 s3_utils.py – presign helpers + tiny upload/download wrappers.
-Now returns both snake_case AND camelCase keys so the existing JS
-upload code works unmodified.
+
+• `presign_single_post`   → one-shot HTML-form POST, up to the S3 limit (5 GB)
+• `presign_multipart`     → presigned multipart upload for larger files
+Both return snake_case *and* camelCase keys so the existing JS works.
 """
 from __future__ import annotations
 import os, math, tempfile, uuid, logging
@@ -15,13 +17,12 @@ from botocore.exceptions import ClientError
 BUCKET   = os.getenv("S3_BUCKET")
 REGION   = os.getenv("AWS_REGION", "eu-south-1")
 ACCEL_ON = os.getenv("S3_ACCEL", "0") == "1"
-PART_MB  = int(os.getenv("PART_MB", 32))
+PART_MB  = int(os.getenv("PART_MB", 32))       # each multipart chunk MB
 
 if not BUCKET:
     raise RuntimeError("S3_BUCKET env var missing")
 
-TMP_ROOT = Path(os.getenv("TMPDIR", "/tmp"))
-TMP_ROOT.mkdir(parents=True, exist_ok=True)
+TMP_ROOT = Path(os.getenv("TMPDIR", "/tmp")); TMP_ROOT.mkdir(exist_ok=True)
 
 _session = boto3.session.Session(
     aws_access_key_id     = os.getenv("AWS_ACCESS_KEY_ID"),
@@ -34,7 +35,9 @@ acc = _session.client("s3",
 
 # ── presign helpers ──────────────────────────────────────────────────
 def presign_single_post(filename: str, expires: int = 3600) -> dict:
-    """≤ 100 MB direct form POST."""
+    """
+    Return a presigned HTML-form POST that accepts any file ≤ 5 GB.
+    """
     key  = f"full/{filename}"
     post = s3.generate_presigned_post(
         Bucket     = BUCKET,
@@ -43,7 +46,7 @@ def presign_single_post(filename: str, expires: int = 3600) -> dict:
         Fields     = {"Content-Type": "video/mp4"},
         Conditions = [
             ["starts-with", "$Content-Type", "video/"],
-            ["content-length-range", 0, 5_368_709_120],
+            ["content-length-range", 0, 5_368_709_120],   # 5 GB hard S3 limit
         ],
     )
     post.setdefault("url",
@@ -51,12 +54,15 @@ def presign_single_post(filename: str, expires: int = 3600) -> dict:
     return {
         **post,
         "multipart": False,
-        "s3_key"   : key,   # backend
-        "key"      : key,   # frontend (camel-case)
+        "s3_key"   : key,   # backend (snake)
+        "key"      : key,   # frontend (camel)
     }
 
 def presign_multipart(filename: str, size: int, expires: int = 3600) -> dict:
-    """> 100 MB multipart PUTs."""
+    """
+    Multipart upload for files > 5 GB (or any size if you prefer).
+    Browser PUTs each part to the URLs we return, then calls complete_url.
+    """
     key   = f"full/{filename}"
     parts = math.ceil(size / (PART_MB * 1_048_576))
 
@@ -105,7 +111,7 @@ def presign_multipart(filename: str, size: int, expires: int = 3600) -> dict:
         "completeUrl" : complete_url,
     }
 
-# ── small wrappers ───────────────────────────────────────────────────
+# ── thin wrappers for downloading / uploading inside the worker ──────
 def upload_file(local: Path, key: str) -> str:
     s3.upload_file(str(local), BUCKET, key)
     return key
