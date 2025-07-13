@@ -6,9 +6,11 @@
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
   <style>
-    body{background:#f8f9fa}
-    .brand{color:#c41e3a;font-weight:700}
-    #log{white-space:pre-wrap;font-family:monospace}
+    body      { background:#f8f9fa }
+    .brand    { color:#c41e3a;font-weight:700 }
+    #log      { white-space:pre-wrap;font-family:monospace }
+    #bar      { transition:width .2s }
+    #stat     { font-size:.8rem;color:#555 }
   </style>
 </head>
 <body class="py-5">
@@ -17,111 +19,125 @@
 
   <div class="card p-4 shadow-sm">
     <div class="mb-3"><input type="file" id="file" accept="video/mp4" class="form-control"></div>
+
     <div class="mb-3">
       <label class="form-label">Numri i pjesëve</label>
-      <input type="number" id="parts" class="form-control" min="2" value="5">
+      <input  type="number" id="parts" class="form-control" min="2" value="5">
     </div>
+
     <button class="btn btn-danger w-100" onclick="upload()">Starto</button>
   </div>
 
   <div class="progress my-3" style="height:.8rem;display:none">
-    <div id="bar" class="progress-bar bg-danger" style="width:0%"></div>
+    <div id="bar" class="progress-bar bg-danger"></div>
   </div>
+  <div id="stat" class="mb-2"></div>
 
   <pre id="log" class="mt-3"></pre>
 </div>
 
 <script>
-/* helper functions --------------------------------------------------- */
-const log = t => (document.getElementById('log').textContent += t + '\n');
-const bar = p => { document.querySelector('.progress').style.display='block';
-                   document.getElementById('bar').style.width = p.toFixed(1)+'%'; };
-const pretty = n => { const u=['KB','MB','GB','TB']; let i=-1;
-                      do{n/=1024;++i;}while(n>=1024&&i<u.length-1);
-                      return n.toFixed(1)+' '+u[i]; };
+/* ── small helpers ─────────────────────────────────────────────────── */
+const log  = t => { const el=document.getElementById('log');
+                    el.textContent+=t+"\n"; el.scrollTop=el.scrollHeight; };
 
-let pingID=0;
-const startPing = (ms=15_000) => pingID=setInterval(()=>fetch('/ping'), ms);
-const stopPing  = () => clearInterval(pingID);
+const showBar = () => document.querySelector('.progress').style.display='block';
+const setBar  = p  => document.getElementById('bar').style.width = p.toFixed(1)+'%';
+const setStat = s  => document.getElementById('stat').textContent = s;
+const MB      = n  => (n/1048576).toFixed(1)+' MB';
 
-/* orchestrator ------------------------------------------------------- */
-async function upload () {
+let pingId=0;
+const pingStart = ()=> pingId=setInterval(()=>fetch('/ping'),15_000);
+const pingStop  = ()=> clearInterval(pingId);
+
+/* ── orchestrator ──────────────────────────────────────────────────── */
+async function upload(){
   const file  = document.getElementById('file').files[0];
-  const parts = document.getElementById('parts').value || 5;
+  const parts = +document.getElementById('parts').value || 5;
   if(!file){ alert('Zgjidhni një MP4'); return; }
 
-  log('🚦 /sign …');
+  log('🚦 /sign…');
   const sign = await fetch('/sign',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
         body:JSON.stringify({filename:file.name,size:file.size})
       }).then(r=>r.json());
 
-  startPing();                     // keep Render instance alive
+  pingStart();
   try{
-    if(sign.multipart) await uploadMultipart(file, sign);
-    else               await uploadSinglePost(file, sign);
-  }finally{ stopPing(); }
+    if(sign.multipart) await doMultipart(file, sign);
+    else               await doSinglePOST(file, sign);
+  }finally{ pingStop(); }
 
-  log('🚦 /start-job …');
+  log('🚦 /start-job…');
   const j = await fetch('/start-job',{
         method:'POST',
         headers:{'Content-Type':'application/json'},
-        body:JSON.stringify({s3_key:sign.s3_key, parts})
+        body:JSON.stringify({s3_key:sign.s3_key,parts})
       }).then(r=>r.json());
   window.location = j.stream;
 }
 
-/* single POST (≤100 MB) --------------------------------------------- */
-async function uploadSinglePost(file, sign){
-  const fd = new FormData();
+/* ── plain form-POST  (≤5 GB) ─────────────────────────────────────── */
+async function doSinglePOST(file, sign){
+  const fd=new FormData();
   Object.entries(sign.fields).forEach(([k,v])=>fd.append(k,v));
-  fd.append('file', file);
+  fd.append('file',file);
 
-  log(`⬆️  Uploading ${pretty(file.size)} …`);
-  await new Promise((res, rej)=>{
-    const x=new XMLHttpRequest();
-    x.open('POST', sign.url, true);
-    x.upload.onprogress = e => e.lengthComputable && bar(e.loaded/e.total*100);
-    x.onload  = () => x.status===204 ? res() : rej('S3 '+x.status);
-    x.onerror = () => rej('network/CORS error');
-    x.send(fd);
+  log(`⬆️ Uploading ${MB(file.size)}…`);
+  showBar();
+
+  await new Promise((resolve,reject)=>{
+    const xhr=new XMLHttpRequest();
+    xhr.open('POST',sign.url,true);
+    xhr.upload.onprogress=e=>{
+      if(e.lengthComputable){
+        setBar(e.loaded/e.total*100);
+        setStat(`${MB(e.loaded)} / ${MB(e.total)}`);
+      }
+    };
+    xhr.onload = ()=> xhr.status===204 ? resolve():reject('S3 '+xhr.status);
+    xhr.onerror=()=> reject('network/CORS');
+    xhr.send(fd);
   });
-  bar(100); log('✅ Upload complete');
+
+  setBar(100); setStat(`${MB(file.size)} / ${MB(file.size)}`);
+  log('✅ Upload complete');
 }
 
-/* multipart (>100 MB) ------------------------------------------------ */
-async function uploadMultipart(file, m){
-  const {part_urls, complete_url, part_mb} = m;
-  const partSize = part_mb * 1024 * 1024;
-  const etags    = Array(part_urls.length);
-  const total    = part_urls.length;
-  const maxPar   = 5;
-  let   done     = 0;
+/* ── multipart (>5 GB OR whatever threshold you set) ──────────────── */
+async function doMultipart(file,{part_urls,complete_url,part_mb}){
+  const partSize = part_mb*1048576;
+  const totalParts=part_urls.length;
+  const etags=Array(totalParts);
+  const parallel=5;      // upload at most 5 parts at once
+  let done=0, uploaded=0; showBar();
 
-  log(`⬆️  Multipart ${total}×${part_mb} MB…`);
-  const put = async i=>{
-    const blob = file.slice(i*partSize, Math.min((i+1)*partSize, file.size));
-    const r    = await fetch(part_urls[i], {method:'PUT', body:blob});
-    if(!r.ok) throw new Error('part '+(i+1));
-    etags[i] = {ETag:r.headers.get('ETag'), PartNumber:i+1};
-    bar(++done/total*100); log('   ✅ part '+(i+1)+'/'+total);
+  log(`⬆️ Multipart ${totalParts} × ${part_mb} MB…`);
+  const work=[...Array(totalParts).keys()];
+  const put = async idx=>{
+    const blob=file.slice(idx*partSize, Math.min((idx+1)*partSize,file.size));
+    const r   = await fetch(part_urls[idx],{method:'PUT',body:blob});
+    if(!r.ok) throw new Error('part '+(idx+1));
+    etags[idx]={ETag:r.headers.get('ETag'),PartNumber:idx+1};
+    uploaded += blob.size;
+    setBar((++done)/totalParts*100);
+    setStat(`${MB(uploaded)} / ${MB(file.size)}`);
+    log(`   ✅ part ${idx+1}/${totalParts}`);
   };
-  const q=[...Array(total).keys()];
-  await Promise.all([...Array(Math.min(maxPar,total))].map(async()=>{
-    while(q.length) await put(q.shift());
+  await Promise.all([...Array(Math.min(parallel,totalParts))].map(async()=>{
+    while(work.length) await put(work.shift());
   }));
 
-  const body=`<CompleteMultipartUpload>${
-      etags.map(e=>`<Part><ETag>${e.ETag}</ETag><PartNumber>${e.PartNumber}</PartNumber></Part>`).join('')
-    }</CompleteMultipartUpload>`;
-  const r = await fetch(complete_url,{
-        method:'POST',
-        headers:{'Content-Type':'application/xml'},
-        body
-      });
+  /* complete */
+  const body='<CompleteMultipartUpload>'+etags.map(e=>
+      `<Part><ETag>${e.ETag}</ETag><PartNumber>${e.PartNumber}</PartNumber></Part>`).join('')
+    +'</CompleteMultipartUpload>';
+
+  const r = await fetch(complete_url,{method:'POST',headers:{'Content-Type':'application/xml'},body});
   if(!r.ok) throw new Error('complete failed');
-  bar(100); log('✅ Upload complete');
+  setBar(100); setStat(`${MB(file.size)} / ${MB(file.size)}`);
+  log('✅ Upload complete');
 }
 </script>
 <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
