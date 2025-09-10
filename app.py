@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import os
 import sys
+import csv
 import time
 import uuid
 import json
@@ -11,7 +12,7 @@ import traceback
 import subprocess
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, Iterable, Optional
+from typing import Dict, Any, Iterable, Optional, List, Tuple
 
 from flask import (
     Flask, request, jsonify, Response,
@@ -36,15 +37,12 @@ PYTHON       = os.getenv("PYTHON_BIN", sys.executable)
 CUT_SCRIPT   = str(BASE / "cut.py")
 TITLE_SCRIPT = str(BASE / "title_clips.py")
 
-# S3 helpers (match your s3_utils.py)
+# S3 helpers you already have
 from s3_utils import (
     presign_single_post, presign_multipart, download_to_temp, presigned_url
 )
 
-# Pick a template directory smartly:
-# 1) TEMPLATE_DIR env → use it
-# 2) if ./templates/index.html exists → use ./templates
-# 3) if ./index.html exists → use repo root
+# Choose where to load templates (index.html/stream.html/done.html)
 def _choose_templates_dir() -> str:
     override = os.getenv("TEMPLATE_DIR")
     if override:
@@ -53,7 +51,7 @@ def _choose_templates_dir() -> str:
         return str(BASE / "templates")
     if (BASE / "index.html").exists():
         return str(BASE)
-    return str(BASE / "templates")  # default (even if file missing)
+    return str(BASE / "templates")
 
 TEMPLATES_DIR = _choose_templates_dir()
 app = Flask(__name__, template_folder=TEMPLATES_DIR, static_folder=None)
@@ -65,10 +63,10 @@ logging.basicConfig(
 )
 log = logging.getLogger("app")
 
-# In-memory job params (streaming itself is per-request)
+# In-memory job params (streaming is per request)
 JOBS: Dict[str, Dict[str, Any]] = {}
 
-# Up to 5 GB as single POST; above that use multipart
+# Up to 5 GB as single POST; larger uses multipart
 SINGLE_POST_MAX = 5_000_000_000  # 5 GB
 
 
@@ -89,53 +87,89 @@ def _fmt_exc(e: BaseException) -> str:
     return "".join(traceback.format_exception(type(e), e, e.__traceback__))
 
 def _render_html(name: str, **ctx) -> Response:
-    """
-    Robust renderer:
-    - Try Jinja (render_template).
-    - If the template isn't installed, try sending a static file from either
-      the chosen template dir, repo root, or ./templates.
-    - Minimal substitution for {{ job_id }} and {{ url_for('done') }} if needed.
-    """
+    """Render template with graceful fallback to static file."""
     try:
         return render_template(name, **ctx)
     except TemplateNotFound:
-        # Try known locations
+        # Fallback to static files in common locations
         for folder in [Path(TEMPLATES_DIR), BASE / "templates", BASE]:
             p = folder / name
             if p.exists():
                 html = p.read_text(encoding="utf-8")
-                # naive replacements if Jinja isn't available in static file
+                # minimal replacements so links still work if needed
                 if "job_id" in ctx:
                     for tok in (f"{{{{ job_id }}}}", "{{job_id}}"):
                         html = html.replace(tok, str(ctx["job_id"]))
-                html = html.replace("{{ url_for('done') }}", "/done")
+                html = html.replace("{{ url_for('done_latest') }}", "/done")
+                html = html.replace("{{ url_for('index') }}", "/")
                 return Response(html, mimetype="text/html; charset=utf-8")
-        # Last resort
         return Response(f"<h1>Template not found: {name}</h1>", status=500, mimetype="text/html")
+
+def _latest_titles_csv() -> Optional[Path]:
+    files = sorted(LOG_DIR.glob("clip_titles_*.csv"))
+    return files[-1] if files else None
+
+def _read_titles(csv_path: Path) -> List[Dict[str, str]]:
+    """
+    Read the titles CSV your title_clips.py writes: header 'file,title'
+    Returns list of dicts: {'file': ..., 'title': ...}
+    """
+    clips: List[Dict[str, str]] = []
+    with csv_path.open("r", encoding="utf-8") as f:
+        reader = csv.reader(f)
+        header = next(reader, None)  # ['file', 'title']
+        for row in reader:
+            if not row:
+                continue
+            # be lenient: allow commas inside title
+            file = row[0]
+            title = ",".join(row[1:]) if len(row) > 1 else ""
+            clips.append({"file": file, "title": title})
+    return clips
 
 
 # ──────────────────────────────────────────────────────────────────────
 # Pages
 # ──────────────────────────────────────────────────────────────────────
 @app.route("/")
-def home():
+def index():  # function name 'index' so url_for('index') works in done.html
     return _render_html("index.html")
 
 @app.route("/stream/<job_id>")
 def stream_page(job_id: str):
     return _render_html("stream.html", job_id=job_id)
 
-@app.route("/done")
-def done():
-    return "✅ Done. You can close this tab.", 200
-
 @app.route("/ping")
 def ping():
     return ("", 204)
 
+# Nice gallery page that shows the newest results
+@app.route("/done")
+def done_latest():
+    csv_path = _latest_titles_csv()
+    if not csv_path:
+        return Response("Nuk ka rezultate ende. Xhiro një punë fillimisht.", mimetype="text/plain")
+    try:
+        clips = _read_titles(csv_path)
+    except Exception as e:
+        return Response(f"Leximi i CSV dështoi: {e}", status=500, mimetype="text/plain")
+    return _render_html("done.html", clips=clips)
+
+# Same gallery for a specific CSV name
+@app.route("/done/<path:csv_name>")
+def done_from_csv(csv_name: str):
+    p = LOG_DIR / csv_name
+    if not p.exists():
+        return ("Not found", 404)
+    try:
+        clips = _read_titles(p)
+    except Exception as e:
+        return Response(f"Leximi i CSV dështoi: {e}", status=500, mimetype="text/plain")
+    return _render_html("done.html", clips=clips)
+
 
 # ──────────────────────────────────────────────────────────────────────
-# Presign API (what your index.html expects)
+# Presign API (consistent with your frontend)
 # ──────────────────────────────────────────────────────────────────────
 @app.route("/sign", methods=["POST"])
 def sign():
@@ -147,7 +181,7 @@ def sign():
         out = presign_single_post(filename)         # fields+url for HTML form POST
         mp = False
     else:
-        out = presign_multipart(filename, size)     # presigned multipart URLs
+        out = presign_multipart(filename, size)     # multipart PUTs
         mp = True
 
     log.info("sign → %s (%s bytes) multipart=%s", filename, f"{size:,}", mp)
@@ -155,13 +189,13 @@ def sign():
 
 
 # ──────────────────────────────────────────────────────────────────────
-# Start job; returns JSON containing a link to the streaming page
+# Start job; returns JSON containing the stream page URL
 # ──────────────────────────────────────────────────────────────────────
 @app.route("/start-job", methods=["POST"])
 def start_job():
     data = request.get_json(force=True)
-    s3_key  = data.get("s3_key") or data.get("s3Key") or data.get("key")
-    parts   = data.get("parts")
+    s3_key   = data.get("s3_key") or data.get("s3Key") or data.get("key")
+    parts    = data.get("parts")
     interval = data.get("interval")
 
     if not s3_key:
@@ -177,11 +211,7 @@ def start_job():
         "created_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
     }
     log.info("JOB %s queued parts=%s interval=%s s3=%s", job_id, parts, interval, s3_key)
-    return jsonify({
-        "ok": True,
-        "job_id": job_id,
-        "stream": url_for("stream_page", job_id=job_id),
-    })
+    return jsonify({"ok": True, "job_id": job_id, "stream": url_for("stream_page", job_id=job_id)})
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -195,18 +225,19 @@ def stream_raw(job_id: str):
 
     def gen():
         src_path: Optional[Path] = None
+        latest_csv: Optional[Path] = None
         try:
             log.info("JOB %s start parts=%s interval=%s s3=%s",
                      job_id, job["parts"], job["interval"], job["s3_key"])
 
-            # 1) Download source to persistent disk (keeps your current flow)
+            # 1) Download source to disk (keeps your current behavior)
             t0 = time.perf_counter()
             src_path = download_to_temp(job["s3_key"])
             yield f"⬇️  Shkarkim nga S3: {job['s3_key']}\n"
             yield "Shkarkuar ✅\n"
             log.info("download %.1fs", time.perf_counter() - t0)
 
-            # 2) Split into parts
+            # 2) Split into parts (cut.py prints slice progress)
             yield "\n✂️  Prerja në pjesë…\n"
             t1 = time.perf_counter()
             if job["parts"]:
@@ -220,9 +251,22 @@ def stream_raw(job_id: str):
             # 3) Titles (title_clips.py prefers .ogg, falls back to .mp4)
             yield "\n📝 Gjenerimi i titujve…\n"
             t2 = time.perf_counter()
+            # capture the [OK] line so we know which CSV to open
             for ln in _run([PYTHON, TITLE_SCRIPT]):
                 yield ln + "\n"
+                if ln.startswith("[OK] Titles saved ->"):
+                    csv_str = ln.split("->", 1)[1].strip()
+                    latest_csv = Path(csv_str)
             log.info("title %.1fs", time.perf_counter() - t2)
+
+            # 4) Link to results page
+            if not latest_csv:
+                latest_csv = _latest_titles_csv()
+            if latest_csv and latest_csv.exists():
+                url = url_for("done_from_csv", csv_name=latest_csv.name, _external=True)
+            else:
+                url = url_for("done_latest", _external=True)
+            yield f"\n📄 Rezultatet: {url}\n"
 
             yield "\n🎉 FINISHED\n"
             log.info("JOB %s OK", job_id)
