@@ -15,7 +15,8 @@ from typing import Dict, Any, Iterable, Optional, List
 
 from flask import (
     Flask, request, jsonify, Response,
-    render_template, send_from_directory, redirect, url_for
+    render_template, send_from_directory, redirect, url_for,
+    stream_with_context,  # <-- keep request/app context during streaming
 )
 from dotenv import load_dotenv
 
@@ -40,7 +41,7 @@ from s3_utils import (
     presign_single_post, presign_multipart, download_to_temp, presigned_url
 )
 
-# Use your templates/ folder explicitly (you have index.html, stream.html, done.html there)
+# Use templates/ explicitly (you have index.html, stream.html, done.html there)
 app = Flask(__name__, template_folder=str(BASE / "templates"), static_folder=None)
 
 logging.basicConfig(
@@ -96,7 +97,7 @@ def _read_titles(csv_path: Path) -> List[Dict[str, str]]:
 # Pages
 # ──────────────────────────────────────────────────────────────────────
 @app.route("/")
-def index():  # keep name 'index' for url_for('index') from templates
+def index():  # for url_for('index') in templates
     return render_template("index.html")
 
 @app.route("/stream/<job_id>")
@@ -186,7 +187,7 @@ def stream_raw(job_id: str):
     if not job:
         return Response(f"⛔ Unknown job id {job_id}\n", mimetype="text/plain", status=404)
 
-    def gen():
+    def _generator():
         src_path: Optional[Path] = None
         latest_csv: Optional[Path] = None
         try:
@@ -220,13 +221,13 @@ def stream_raw(job_id: str):
                     latest_csv = Path(ln.split("->", 1)[1].strip())
             log.info("title %.1fs", time.perf_counter() - t2)
 
-            # 4) Link to results page
+            # 4) Link to results page (relative URL; request context kept by stream_with_context)
             if not latest_csv:
                 latest_csv = _latest_titles_csv()
             if latest_csv and latest_csv.exists():
-                url = url_for("done_from_csv", csv_name=latest_csv.name, _external=True)
+                url = url_for("done_from_csv", csv_name=latest_csv.name)  # relative ok
             else:
-                url = url_for("done", _external=True)
+                url = url_for("done")
             yield f"\n📄 Rezultatet: {url}\n"
 
             yield "\n🎉 FINISHED\n"
@@ -246,7 +247,8 @@ def stream_raw(job_id: str):
             except Exception:
                 pass
 
-    return Response(gen(), mimetype="text/plain; charset=utf-8")
+    # IMPORTANT: wrap with stream_with_context so url_for works inside the generator
+    return Response(stream_with_context(_generator()), mimetype="text/plain; charset=utf-8")
 
 
 # ──────────────────────────────────────────────────────────────────────
