@@ -3,10 +3,10 @@
 title_clips.py – generate Albanian titles for clips in $CLIPS_DIR.
 
 USAGE
-  # old behavior (all clips)
+  # old behavior (all clips in CLIPS_DIR)
   python title_clips.py
 
-  # new: only these files (basenames that live in $CLIPS_DIR)
+  # new, preferred: only these files (basenames in CLIPS_DIR or S3 clips/<name>)
   python title_clips.py --files a_part1.mp4 a_part2.mp4 ...
 """
 from __future__ import annotations
@@ -25,8 +25,13 @@ from typing import Iterable, List, Tuple
 import requests
 from dotenv import load_dotenv
 
+# use your existing S3 helpers
+from s3_utils import download_to_temp
+
 # ── env & paths ───────────────────────────────────────────────────────
 BASE        = Path(__file__).resolve().parent
+load_dotenv(BASE / ".env")
+
 DEFAULT_DIR = BASE / "videos" / "clips"
 CLIPS_DIR   = Path(os.getenv("CLIPS_DIR", DEFAULT_DIR))
 CLIPS_DIR.mkdir(parents=True, exist_ok=True)
@@ -52,14 +57,25 @@ def _shell(cmd: List[str]) -> None:
     if p.returncode != 0:
         raise RuntimeError(f"Command failed ({p.returncode}): {' '.join(cmd)}\n{p.stdout}")
 
-def _to_ogg(mp4: Path) -> Path:
-    ogg = mp4.with_suffix(".ogg")
+def _ensure_local_mp4(basename: str) -> Tuple[Path, bool]:
+    """
+    Return a local path to the clip MP4 and whether it should be cleaned up afterwards.
+    If not found in CLIPS_DIR, download from S3 key 'clips/<basename>'.
+    """
+    local = CLIPS_DIR / basename
+    if local.exists():
+        return local, False
+    # not local → fetch from S3 to a temp path
+    tmp = download_to_temp(f"clips/{basename}")
+    return tmp, True
+
+def _to_ogg(src_mp4: Path) -> Path:
+    ogg = src_mp4.with_suffix(".ogg")
     if ogg.exists():
         return ogg
-    # mono 16 kHz, opus, small bitrate – good for transcription
     _shell([
         FFMPEG, "-hide_banner", "-loglevel", "error",
-        "-y", "-i", str(mp4),
+        "-y", "-i", str(src_mp4),
         "-vn", "-ac", "1", "-ar", "16000", "-c:a", "libopus", "-b:a", "48k",
         str(ogg),
     ])
@@ -80,7 +96,6 @@ def _openai_transcribe(ogg: Path) -> str:
         )
     r.raise_for_status()
     js = r.json()
-    # whisper-style returns {"text": "..."}
     return js.get("text") or js
 
 def _openai_title(transcript: str) -> str:
@@ -108,42 +123,50 @@ def _openai_title(transcript: str) -> str:
     js = r.json()
     return js["choices"][0]["message"]["content"].strip()
 
-def _title_for_file(mp4: Path) -> Tuple[str, str]:
-    logging.info("processing %s", mp4.name)
-    ogg = _to_ogg(mp4)
-    transcript = _openai_transcribe(ogg)
-    title = _openai_title(transcript)
-    if not KEEP_OGG:
-        try:
-            ogg.unlink(missing_ok=True)
-        except Exception:
-            pass
-    return (mp4.name, title)
+def _title_for_basename(basename: str) -> Tuple[str, str]:
+    logging.info("processing %s", basename)
+    mp4_path, cleanup = _ensure_local_mp4(basename)
+    try:
+        ogg = _to_ogg(mp4_path)
+        transcript = _openai_transcribe(ogg)
+        title = _openai_title(transcript)
+    finally:
+        if not KEEP_OGG:
+            try:
+                ogg.unlink(missing_ok=True)  # type: ignore[name-defined]
+            except Exception:
+                pass
+        if cleanup:
+            try:
+                mp4_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+    return (basename, title)
 
 # ── main ──────────────────────────────────────────────────────────────
 def _parse() -> argparse.Namespace:
     p = argparse.ArgumentParser()
     p.add_argument(
         "--files", nargs="*", default=None,
-        help="Optional list of clip *basenames* (e.g. file_part1.mp4) to process from $CLIPS_DIR. "
-             "If omitted, all *.mp4 are processed."
+        help="Optional list of clip *basenames* (e.g. file_part1.mp4). "
+             "If omitted, all *.mp4 in $CLIPS_DIR are processed."
     )
     return p.parse_args()
 
 def main() -> None:
     args = _parse()
-    # decide set of clips
     if args.files:
-        candidates = [CLIPS_DIR / f for f in args.files]
+        basenames = args.files
     else:
-        candidates = sorted(CLIPS_DIR.glob("*.mp4"))
+        basenames = [p.name for p in sorted(CLIPS_DIR.glob("*.mp4"))]
 
     rows: List[Tuple[str, str]] = []
-    for mp4 in candidates:
-        if not mp4.exists():
-            # skip silently if the clip was cleaned or never existed locally
-            continue
-        rows.append(_title_for_file(mp4))
+    for bn in basenames:
+        # silently skip non-existent remote/local only if download fails
+        try:
+            rows.append(_title_for_basename(bn))
+        except Exception as e:
+            logging.info("skip %s (error: %s)", bn, e)
 
     ts  = datetime.datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     out = LOG_DIR / f"clip_titles_{ts}.csv"
